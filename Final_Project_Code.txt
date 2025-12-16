@@ -1,0 +1,161 @@
+/*
+Authors: Christopher Maldonado
+
+*/
+#include <LiquidCrystal.h>
+#include <Stepper.h>
+#include <RTClib.h>
+#include <DHT.h>
+#include <avr/io.h>
+#include <avr/interrupt.h>
+
+// ---------- constants ----------
+#define REV_STEPS   2038           // 28BYJ‑48 stepper
+#define FAN_MASK    (1 << PB4)     // pin 10
+#define START_BTN   (1 << PB3)     // pin 50
+#define RESET_BTN   (1 << PB2)     // pin 51
+#define CTRL_BTN    (1 << PB1)     // pin 52
+
+const uint16_t TEMP_ON_F   = 50;
+const uint16_t HIGH_WTR    = 250; 
+const uint16_t LOW_WTR     = 200; 
+
+// ---------- objects ----------
+LiquidCrystal lcd(12,11,6,5,4,3);
+Stepper stepper(REV_STEPS, 28,26,24,22);
+DHT dht(7, DHT11);
+RTC_DS3231 rtc;
+
+// ---------- state ----------
+enum STATE {DISABLED, IDLE, ERROR, RUNNING};
+STATE state = DISABLED, prevState = DISABLED;
+uint32_t ms = 0;
+uint16_t water = 0;
+
+// ---------- LED map ----------
+const uint8_t STATE_LED[4] = {
+  0x80, // DISABLED → YELLOW (PC7)
+  0x20, // IDLE     → GREEN  (PC5)
+  0x08, // ERROR    → RED    (PC3)
+  0x02  // RUNNING  → BLUE   (PC1)
+};
+
+// Mask for LED pins (PC1, PC3, PC5, PC7)
+const uint8_t LED_MASK = 0xAA;
+
+// ---------- helpers ----------
+uint16_t adcRead(uint8_t ch) {
+  ADMUX  = (1 << REFS0) | (ch & 0x07);
+  ADCSRA |= (1 << ADSC);
+  while (ADCSRA & (1 << ADSC));
+  return ADC;
+}
+
+ISR(TIMER2_COMPA_vect) { ++ms; }
+
+void updateLCD(float tempF, float hum) {
+  lcd.setCursor(0,0);
+  lcd.print("T:"); lcd.print((int)tempF); lcd.print("F ");
+  lcd.print("W:"); lcd.print(water); lcd.print("   ");
+
+  lcd.setCursor(0,1);
+  lcd.print("H:"); lcd.print((int)hum); lcd.print("% ");
+  lcd.print(state == RUNNING ? "RUN" :
+            state == IDLE    ? "IDLE" :
+            state == ERROR   ? "ERR" : "OFF");
+}
+
+// ---------- NEW: LED-only updater ----------
+void updateStateLEDs(STATE s) {
+  // Preserve other PORTC bits, update only LED pins
+  PORTC = (PORTC & ~LED_MASK) | (STATE_LED[s] & LED_MASK);
+}
+
+void handleButtons() {
+  if (!(PINB & START_BTN)) {
+    while (!(PINB & START_BTN));
+    if (state == DISABLED) {
+      state = IDLE;
+      lcd.clear(); lcd.print("START → IDLE");
+    }
+  }
+
+  if (!(PINB & RESET_BTN)) {
+    while (!(PINB & RESET_BTN));
+    state = DISABLED;
+    PORTB &= ~FAN_MASK;
+    lcd.clear(); lcd.print("RESET: DISABLED");
+  }
+
+  if (!(PINB & CTRL_BTN)) {
+    while (!(PINB & CTRL_BTN));
+    lcd.clear(); lcd.print("Vent turning...");
+    stepper.step(REV_STEPS);
+    lcd.setCursor(0,1); lcd.print("Done");
+  }
+}
+
+void applyStateActions() {
+  switch (state) {
+    case RUNNING: PORTB |= FAN_MASK; break;
+    default:      PORTB &= ~FAN_MASK; break;
+  }
+}
+
+// ---------- setup ----------
+void setup() {
+  lcd.begin(16,2);
+  dht.begin();
+  rtc.begin();
+  stepper.setSpeed(10);
+
+  DDRC  |= LED_MASK;                     // LEDs
+  DDRB  |= FAN_MASK;                     // fan
+  DDRB  &= ~(START_BTN|RESET_BTN|CTRL_BTN);
+  PORTB |=  (START_BTN|RESET_BTN|CTRL_BTN); // pull‑ups
+
+  ADCSRA = (1<<ADEN)|(1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0);
+
+  TCCR2A = (1<<WGM21);
+  TCCR2B = (1<<CS22);
+  OCR2A  = 249;
+  TIMSK2 = (1<<OCIE2A);
+  sei();
+
+  lcd.print("System Ready");
+  updateStateLEDs(state);
+}
+
+// ----------- loop ----------
+void loop() {
+  static uint32_t lastSens=0;
+  if (ms - lastSens >= 1000) {
+    lastSens = ms;
+
+    water = adcRead(0);
+    float tempF = dht.readTemperature(true);
+    float hum   = dht.readHumidity();
+
+    // water hysteresis
+    if (state != ERROR && water < LOW_WTR) state = ERROR;
+    if (state == ERROR  && water >= HIGH_WTR) state = IDLE;
+
+    // temperature trigger
+    if (state == IDLE    && tempF >= TEMP_ON_F) state = RUNNING;
+    if (state == RUNNING && tempF <  TEMP_ON_F) state = IDLE;
+
+    // humidity trigger
+    if (state == IDLE    && hum >= 50) state = RUNNING;
+    if (state == RUNNING && hum <  50) state = IDLE;
+
+    updateLCD(tempF, hum);
+  }
+
+  handleButtons();
+  applyStateActions();
+
+  if (state != prevState) {
+    updateStateLEDs(state);
+    prevState = state;
+  }
+}
